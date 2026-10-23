@@ -202,39 +202,48 @@ def business_analysis(df: pd.DataFrame, out_dir: Path) -> list[str]:
     r = pd.to_datetime(lab["rules_synced_at"], format="mixed", utc=True)
     lab["lag_h"] = (a - r).dt.total_seconds() / 3600
     neg = int((lab["lag_h"] < 0).sum())
-    add("## 1. 假设一：初审时规则库「半旧」（滞后 0.5–1h）→ **成立，最强根因信号**")
+    add("## 1. 假设一：初审时规则库「半旧」（lag > ~10 分钟）→ **成立，最强根因信号**")
     add(f"- 滞后（audit_time − rules_synced_at，两列时区已统一）：中位 {lab['lag_h'].median():.2f}h，"
         f"P75 {lab['lag_h'].quantile(.75):.2f}h，最大 {lab['lag_h'].max():.1f}h——"
         "表面看规则同步近实时（全量滞后 ≤ 1h），粗看会误判为非问题。")
-    add("- 但在这 1 小时内存在**陡峭阈值**：滞后超过半小时的初审，退单率跳升数倍。")
+    add("- 但 5 分钟细分会看到**陡峭断崖**：断崖位于约 10 分钟处，之后全程高位。")
     add("")
-    lab["lag_grp"] = pd.cut(
-        lab["lag_h"], bins=[-1e-9, 0, 0.5, 1e9],
-        labels=["=0h（同分钟）", "0–0.5h", "0.5–1h"])
-    g = lab.groupby("lag_grp", observed=True)["review_ok"].agg(
+    lab["lag_min"] = lab["lag_h"] * 60
+    lab["lag_band"] = pd.cut(
+        lab["lag_min"], bins=[-1, 0, 5, 10, 15, 20, 25, 30, 40, 50, 61],
+        labels=["=0", "0–5", "5–10", "10–15", "15–20", "20–25",
+                "25–30", "30–40", "40–50", "50–60"])
+    g = lab.groupby("lag_band", observed=True)["review_ok"].agg(
         n="size", fail=lambda s: int((s == 0).sum()))
     g["退单率%"] = (g["fail"] / g["n"] * 100).round(1)
     add(g.to_markdown())
     add("")
-    add(f"- **滞后 0.5–1h 的 172 件退单 73 件（42.4%），是基线 {base_rate:.1f}% 的 "
-        f"{42.4 / base_rate:.1f} 倍**；这组只占 {172 / n * 100:.0f}% 的初审量，"
-        f"却贡献 {73 / n_fail * 100:.0f}% 的退单。")
+    hi_mask = lab["lag_min"] > 10
+    fresh_mask = ~hi_mask
+    n_hi = int(hi_mask.sum())
+    f_hi = int((hi_mask & (lab["review_ok"] == 0)).sum())
+    r_hi = f_hi / n_hi * 100
+    r_fresh = (fresh_mask & (lab["review_ok"] == 0)).sum() / fresh_mask.sum() * 100
+    add(f"- **lag>10min 的 {n_hi} 件退单 {f_hi} 件（{r_hi:.1f}%），是规则新鲜组"
+        f"（lag≤10min，退单率 {r_fresh:.1f}%）的 {r_hi / r_fresh:.0f} 倍**；"
+        f"占 {n_hi / n * 100:.0f}% 的初审量，却贡献 {f_hi / n_fail * 100:.0f}% 的退单。")
+    add("- 10–25 分钟各段样本较小（18–40 件/段），单段数值有噪声；但「>10 分钟」整组 "
+        f"（{n_hi} 件、退单率 {r_hi:.1f}%）的量级足够稳。")
     add("- lag=0 的 95 件退单率仅 2.1%，疑似「同步后立即重跑」的记录或重试队列，"
         "样本小、机制不明，仅作观察，不作为策略依据。")
     add("")
-    add("**逐日稳定性检验（排除单日事故）**：lag>0.5h 组的高退单率 7 天全部成立：")
+    add("**逐日稳定性检验（排除单日事故）**：lag>10min 组的高退单率 7 天全部成立：")
     add("")
-    lab["lag_hi"] = lab["lag_h"] > 0.5
     lab["day"] = a.dt.date
-    gd = lab.groupby(["day", "lag_hi"])["review_ok"].agg(
+    gd = lab.groupby(["day", hi_mask.rename("hi")])["review_ok"].agg(
         n="size", fail=lambda s: int((s == 0).sum()))
     gd["退单率%"] = (gd["fail"] / gd["n"] * 100).round(1)
     gd = gd.reset_index()
     gd["day"] = gd["day"].astype(str)
-    gd["组"] = gd["lag_hi"].map({True: "lag>0.5h", False: "lag≤0.5h"})
+    gd["组"] = gd["hi"].map({True: "lag>10min", False: "lag≤10min"})
     add(gd[["day", "组", "n", "fail", "退单率%"]].to_markdown(index=False))
     add("")
-    add("- lag>0.5h 组逐日退单率 36.0%–53.6%（每日均远高于当日 lag≤0.5h 组），"
+    add("- lag>10min 组逐日退单率每日均数倍高于当日 lag≤10min 组，"
         "非单日数据事故，是稳定结构性问题。")
     add("")
 
@@ -250,6 +259,17 @@ def business_analysis(df: pd.DataFrame, out_dir: Path) -> list[str]:
     add(f"- **token>75 组退单率 {g2.loc['>75', '退单率%']}% ≈ 基线的 "
         f"{g2.loc['>75', '退单率%'] / base_rate:.1f} 倍**，且随 token 单调上升（61–75 段已达 "
         f"{g2.loc['61–75', '退单率%']}%）——超长上下文的抽取质量劣化。")
+    add("")
+    tok70 = lab["token_count"] > 70
+    f_ = lab["review_ok"] == 0
+    tok_fail = int((tok70 & f_).sum())
+    tok_fail_hi = int((tok70 & f_ & hi_mask).sum())
+    r_fresh_tok = (f_ & tok70 & fresh_mask).sum() / (tok70 & fresh_mask).sum() * 100
+    add(f"- **条件检验（排查代理混淆）**：token>70 拦下的 {tok_fail} 件退单中 "
+        f"{tok_fail_hi} 件同时落在 lag>10min 组；在规则新鲜的案子里，token>70 "
+        f"退单率仅 {r_fresh_tok:.1f}%（新鲜组基线 {r_fresh:.1f}%），低于 16.7% 盈亏线——"
+        "token 的高退单率大部分是 lag 的代理，独立拦截价值低，"
+        "更适合作人工队列优先级与解析质量监控信号。")
     add("")
 
     # ---- 3) 假设三：低置信分 ----
@@ -268,81 +288,112 @@ def business_analysis(df: pd.DataFrame, out_dir: Path) -> list[str]:
     # ---- 4) 策略：提前转人工（退单 90min，转人工 15min）----
     add("## 4. 策略：按信号提前转人工初审")
     add("- 假设：转人工的案件由法务在初审把关，之后不再退单（人工 15min/件）。")
-    add("- 净节省 = 90min × 命中退单数 − 15min × 转人工件数；"
-        "转人工划算的最低组退单率 = 15/90 = **16.7%**（盈亏平衡线）。")
-    add("- lag>0.5h 在初审发生时即可算得（audit_time 与 rules_synced_at 均为当次记录），"
-        "规则可实时部署；阈值为同数据事后选得，有过拟合风险，按「若该模式成立」解读。")
+    add("- 净节省 = 90min × 命中退单数 − 15min × 转人工件数；转人工划算的最低组退单率 = 15/90 = **16.7%**。")
+    add("- lag 在初审发生时即可由当次记录算得（audit_time 与 rules_synced_at 均为当次记录），"
+        "规则可实时部署；阈值为同数据事后扫描选得，过拟合风险见下。")
     add("")
-    tok = lab["token_count"]
-    conf = lab["rule_conf_score"]
-    lag_hi = lab["lag_h"] > 0.5
-    fails = lab["review_ok"] == 0
-    cand = [
-        ("现状：不转人工", pd.Series(False, index=lab.index)),
-        ("全部转人工", pd.Series(True, index=lab.index)),
-        ("lag>0.5h", lag_hi),
-        ("token>70", tok > 70),
-        ("conf≤5", conf <= 5),
-        ("lag>0.5h 或 token>70", lag_hi | (tok > 70)),
-        ("lag>0.5h 或 conf≤5", lag_hi | (conf <= 5)),
-    ]
-    add("| 策略 | 转人工件数 | 命中退单 | 组内退单率% | 净节省(分钟) |")
+    add("**阈值扫描**（lag > t 分钟 则转人工）：")
+    add("")
+    add("| t(分钟) | 转人工件数 | 命中退单 | 组内退单率% | 净节省(分钟) |")
     add("|:--|--:|--:|--:|--:|")
-    for name, esc in cand:
+    fails = lab["review_ok"] == 0
+    lag_min = lab["lag_min"]
+    sweep = []
+    for t in [0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55]:
+        esc = lag_min > t
         n_esc = int(esc.sum())
         caught = int((esc & fails).sum())
         saved = 90 * caught - 15 * n_esc
         rate = (caught / n_esc * 100) if n_esc else 0.0
-        add(f"| {name} | {n_esc} | {caught} | {rate:.1f} | {saved} |")
+        sweep.append((t, n_esc, caught, rate, saved))
+        add(f"| >{t} | {n_esc} | {caught} | {rate:.1f} | {saved} |")
     add("")
-    best_name, best_esc = max(
-        ((nm, e) for nm, e in cand[1:]),
-        key=lambda t: 90 * int((t[1] & fails).sum()) - 15 * int(t[1].sum()))
-    n_esc = int(best_esc.sum())
-    caught = int((best_esc & fails).sum())
-    saved = 90 * caught - 15 * n_esc
-    add(f"**最优简单规则：{best_name}** —— 转人工 {n_esc} 件（占 {n_esc / n * 100:.0f}%），"
-        f"命中退单 {caught}/{n_fail}（{caught / n_fail * 100:.0f}%），组内退单率 "
-        f"{caught / n_esc * 100:.1f}%（盈亏平衡线 16.7%），"
-        f"净节省 **{saved} 分钟**，相当于现状复审成本（{n_fail * 90} 分钟）的 "
-        f"{saved / (n_fail * 90) * 100:.0f}%。")
+    t_best, n_esc, caught, rate, saved = max(sweep, key=lambda r: r[4])
+    add(f"**最优阈值：lag > {t_best} 分钟** —— 转人工 {n_esc} 件（占 {n_esc / n * 100:.0f}%），"
+        f"命中 {caught}/{n_fail}（{caught / n_fail * 100:.0f}%），组内退单率 {rate:.1f}%，"
+        f"净节省 **{saved} 分钟** = 现状复审成本（{n_fail * 90} 分钟）的 {saved / (n_fail * 90) * 100:.0f}%。")
+    plateau = [r for r in sweep if 10 <= r[0] <= 25]
+    add(f"- **10–25 分钟为平台区**（净节省 {min(r[4] for r in plateau)}–{max(r[4] for r in plateau)} 分钟）："
+        "结论对阈值不敏感，过拟合风险因此可控。")
+    add("- 初版用 0.5h（净省 3990 分钟）是探索分桶的遗产而非扫描结果——"
+        "粗桶先藏掉信号、再把断崖位置标错半小时，阈值扫描后修正为 10 分钟。")
     add("")
-    add("- 对照：全部转人工净节省为负（−5235min）——「初审全废、全上人工」不可取；"
-        "精准只补 lag>0.5h 的 14% 才划算。")
-    add("- **治本建议（需验证）**：在初审执行前校验规则库新鲜度，lag>0.5h 先触发 re-sync "
-        "再初审，或把同步频率加密到 30 分钟内。若该组退单率能回落到 lag≤0.5h 组的 ~7%，"
-        "按数据外推可再省约 73−(172×7%)≈61 件退单 ≈ 5490 分钟——比转人工更省，"
-        "但这是机制假设，需小流量 A/B 验证。")
+    add("**对照策略**（同一成本口径）：")
+    add("")
+    add("| 策略 | 转人工件数 | 命中退单 | 组内退单率% | 净节省(分钟) |")
+    add("|:--|--:|--:|--:|--:|")
+    anchors = [
+        ("现状：不转人工", pd.Series(False, index=lab.index)),
+        ("全部转人工", pd.Series(True, index=lab.index)),
+        ("lag>10min（最优）", lag_min > 10),
+        ("token>70", lab["token_count"] > 70),
+        ("conf≤5", lab["rule_conf_score"] <= 5),
+        ("lag>10min 或 token>70", (lag_min > 10) | (lab["token_count"] > 70)),
+    ]
+    for name, esc in anchors:
+        n_a = int(esc.sum())
+        c_a = int((esc & fails).sum())
+        s_a = 90 * c_a - 15 * n_a
+        r_a = (c_a / n_a * 100) if n_a else 0.0
+        add(f"| {name} | {n_a} | {c_a} | {r_a:.1f} | {s_a} |")
+    add("")
+    add("- token>70 单独使用仅 +420 分钟；叠加进 lag 规则反而把净节省从 6600 拉低到 5685——"
+        "规则新鲜的长卷宗退单率 4.7%，低于盈亏线，转人工亏本。token 不宜做拦截规则。")
+    avoid_est = f_hi - n_hi * (r_fresh / 100)
+    add(f"- **治本建议（需 A/B 验证的机制假设）**：初审执行前校验规则新鲜度，lag>10min 先触发 "
+        f"re-sync 再初审（或把同步频率压到 10 分钟内）。若该组退单率回落到新鲜组基线"
+        f"（{r_fresh:.1f}%），按本数据外推约可避免 {avoid_est:.0f} 件退单 ≈ {avoid_est * 90:.0f} 分钟，"
+        "比转人工更多；但这是机制假设，需小流量验证。")
     add("")
 
-    # ---- 5) 分部门 / 案件类别 ----
-    add("## 5. 分部门 / 案件类别退单率（排除结构性差异）")
-    for col in ["tenant_dept", "dossier_type"]:
-        g4 = lab.groupby(col)["review_ok"].agg(
-            n="size", fail=lambda s: int((s == 0).sum()))
-        g4["退单率%"] = (g4["fail"] / g4["n"] * 100).round(1)
-        g4 = g4.sort_values("退单率%", ascending=False)
-        add(f"**{col}**（Top3 / 全体 {len(g4)} 组）")
-        add(g4.head(3).to_markdown())
-        add("")
-    add("部门/类别差异（15.6% vs 11.3%）远小于规则滞后维度差异（42.4% vs 7.2%），"
-        "不是主要抓手，排除结构性差异后不影响主结论。")
+    # ---- 5) 部门切片：谁会被 re-sync 修好，谁不会 ----
+    add("## 5. 部门切片：lag 驱动的退单占比（预演 re-sync 的部门级效果）")
+    add("")
+    add("| 部门 | 件数 | 退单 | 退单率% | 退单中lag>10min占比% | lag≤10min组退单率% |")
+    add("|:--|--:|--:|--:|--:|--:|")
+    dept_share = {}
+    for dept, sub in lab.groupby("tenant_dept"):
+        idx = sub.index
+        s_hi = hi_mask[idx]
+        s_f = fails[idx]
+        nf = int(s_f.sum())
+        f_hi_d = int((s_hi & s_f).sum())
+        n_fresh_d = int((~s_hi).sum())
+        f_fresh_d = int((~s_hi & s_f).sum())
+        dept_share[dept] = f_hi_d / nf * 100 if nf else 0.0
+        add(f"| {dept} | {len(sub)} | {nf} | {nf / len(sub) * 100:.1f} | "
+            f"{f_hi_d / nf * 100 if nf else 0:.0f} | "
+            f"{f_fresh_d / n_fresh_d * 100 if n_fresh_d else 0:.1f} |")
+    add("")
+    add("- 四个部门 83%–100% 的退单由 lag>10min 贡献，re-sync 上线后应显著回落；"
+        "**华南业务中心是例外**：退单中 lag>10min 仅约三成，且其规则新鲜组的退单率"
+        "（7.3%）为各部门最高——它的问题不在时滞，需单独排查"
+        "（案件构成、部门规则包、低置信/长卷宗比例）。")
+    add("")
+    add("**dossier_type 退单率（Top3 / 全体 10 组）**：部门/类别差异远小于滞后维度差异，"
+        "不是主要抓手，不影响主结论。")
+    g4 = lab.groupby("dossier_type")["review_ok"].agg(
+        n="size", fail=lambda s: int((s == 0).sum()))
+    g4["退单率%"] = (g4["fail"] / g4["n"] * 100).round(1)
+    g4 = g4.sort_values("退单率%", ascending=False)
+    add(g4.head(3).to_markdown())
+    add("")
 
     # ---- 图表 ----
     try:
         fig, axes = plt.subplots(1, 2, figsize=(11, 4))
         g["退单率%"].plot.bar(ax=axes[0], color="#4f46e5")
-        axes[0].set_title("退单率 × 规则滞后（audit − rules_synced）")
-        axes[0].set_xlabel("规则滞后（小时）")
+        axes[0].set_title("退单率 × 规则滞后（分钟）")
+        axes[0].set_xlabel("规则滞后（分钟）")
         axes[0].set_ylabel("退单率（%）")
         axes[0].tick_params(labelsize=8)
         axes[0].axhline(base_rate, ls="--", lw=1, color="#64748b")
-        g2["退单率%"].plot.bar(ax=axes[1], color="#b91c1c")
-        axes[1].set_title("退单率 × token_count")
-        axes[1].set_xlabel("token_count")
-        axes[1].set_ylabel("退单率（%）")
+        share_s = pd.Series(dept_share).sort_values()
+        share_s.plot.barh(ax=axes[1], color="#b91c1c")
+        axes[1].set_title("各部门退单中 lag>10min 占比")
+        axes[1].set_xlabel("占该部门退单的比例（%）")
         axes[1].tick_params(labelsize=8)
-        axes[1].axhline(base_rate, ls="--", lw=1, color="#64748b")
+        axes[1].axvline(50, ls="--", lw=1, color="#64748b")
         fig.tight_layout()
         fig.savefig(out_dir / "evidence_fail_rate.png", dpi=150)
         plt.close(fig)
