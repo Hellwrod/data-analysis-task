@@ -1,0 +1,10 @@
+[project]
+name = "data-analysis-task"
+version = "0.1.0"
+description = "关灯科技实战任务：对发放 CSV 的可复现数据分析（见 README.md）"
+requires-python = ">=3.12"
+dependencies = [
+    "pandas>=2.2",
+    "matplotlib>=3.9",
+    "tabulate>=0.9",
+]
